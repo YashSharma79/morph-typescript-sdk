@@ -29,6 +29,7 @@
     "test:esm": "node test/test-esm.js",
     "test:bun": "bun test/test-bun.ts",
     "test:bunts": "bun test/test-bunts.ts"
+    "test:ssh-key-rotation": "bun test/test-ssh-key-rotation.ts"
   },
   "type": "module",
   "repository": {
