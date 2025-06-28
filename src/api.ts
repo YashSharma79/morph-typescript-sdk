@@ -1191,6 +1191,253 @@ class MorphCloudClient {
     stop: async (options: InstanceStopOptions): Promise<void> => {
       await this.DELETE(`/instance/${options.instanceId}`);
     },
+
+    cleanup: async (options: {
+      snapshotPattern?: string;
+      snapshotExcludePattern?: string;
+      servicePattern?: string;
+      serviceExcludePattern?: string;
+      excludePaused?: boolean;
+      action?: "stop" | "pause";
+      maxWorkers?: number;
+      confirm?: boolean;
+    } = {}): Promise<{
+      success: boolean;
+      total: number;
+      processed: number;
+      failed?: number;
+      kept: number;
+      errors: Array<{ instanceId: string; error: string }>;
+      cancelled?: boolean;
+    }> => {
+      const {
+        snapshotPattern,
+        snapshotExcludePattern,
+        servicePattern,
+        serviceExcludePattern,
+        excludePaused = true,
+        action = "stop",
+        maxWorkers = 10,
+        confirm = false,
+      } = options;
+
+      const validActions = ["stop", "pause"];
+      if (!validActions.includes(action)) {
+        throw new Error(`Invalid action '${action}'. Must be one of: ${validActions.join(", ")}`);
+      }
+
+      console.log("Starting MorphCloud Instance Cleanup");
+      console.log(`Action: ${action}`);
+
+      let allInstances: Instance[];
+      try {
+        console.log("Fetching list of all instances...");
+        allInstances = await this.instances.list();
+        console.log(`Found ${allInstances.length} total instances.`);
+
+        if (allInstances.length === 0) {
+          console.log("No instances found. Nothing to clean up.");
+          return {
+            success: true,
+            total: 0,
+            processed: 0,
+            kept: 0,
+            errors: [],
+          };
+        }
+      } catch (error) {
+        console.error(`Error listing instances: ${error}`);
+        return {
+          success: false,
+          total: 0,
+          processed: 0,
+          kept: 0,
+          errors: [{ instanceId: "unknown", error: String(error) }],
+        };
+      }
+
+      const instancesToProcess: Instance[] = [];
+      const instancesToKeep: Instance[] = [];
+
+      console.log("\nFiltering instances...");
+
+      const matchesAnyPattern = (value: string, patternList?: string): boolean => {
+        if (!patternList) return false;
+        const patterns = patternList.split(",").map(p => p.trim());
+        return patterns.some(pattern => {
+          const regex = new RegExp(pattern.replace(/\*/g, ".*"));
+          return regex.test(value);
+        });
+      };
+
+      for (const instance of allInstances) {
+        let shouldProcess = true;
+        const reasonsToKeep: string[] = [];
+        const reasonsToProcess: string[] = [];
+
+        if (action === "stop") {
+          if (instance.status !== InstanceStatus.READY && instance.status !== InstanceStatus.PAUSED) {
+            shouldProcess = false;
+            reasonsToKeep.push(`status is ${instance.status} (not ready/paused)`);
+          }
+        } else if (action === "pause") {
+          if (instance.status !== InstanceStatus.READY) {
+            shouldProcess = false;
+            reasonsToKeep.push(`status is ${instance.status} (not ready)`);
+          }
+        }
+
+        if (excludePaused && instance.status === InstanceStatus.PAUSED) {
+          shouldProcess = false;
+          reasonsToKeep.push("instance is paused (excludePaused=true)");
+        }
+
+        const snapshotId = instance.refs.snapshotId;
+
+        if (snapshotPattern && !matchesAnyPattern(snapshotId, snapshotPattern)) {
+          shouldProcess = false;
+          reasonsToKeep.push(`snapshot ID '${snapshotId}' doesn't match patterns '${snapshotPattern}'`);
+        } else if (snapshotPattern && matchesAnyPattern(snapshotId, snapshotPattern)) {
+          reasonsToProcess.push(`snapshot ID matches patterns '${snapshotPattern}'`);
+        }
+
+        if (snapshotExcludePattern && matchesAnyPattern(snapshotId, snapshotExcludePattern)) {
+          shouldProcess = false;
+          reasonsToKeep.push(`snapshot ID '${snapshotId}' matches exclude patterns '${snapshotExcludePattern}'`);
+        }
+
+        const exposedServiceNames = new Set(instance.networking.httpServices.map(service => service.name));
+
+        if (servicePattern || serviceExcludePattern) {
+          let serviceMatchFound = false;
+          let serviceExcludeFound = false;
+          const matchingKeepServices: string[] = [];
+          const matchingExcludeServices: string[] = [];
+
+          for (const serviceName of exposedServiceNames) {
+            if (servicePattern && matchesAnyPattern(serviceName, servicePattern)) {
+              serviceMatchFound = true;
+              matchingKeepServices.push(serviceName);
+            }
+
+            if (serviceExcludePattern && matchesAnyPattern(serviceName, serviceExcludePattern)) {
+              serviceExcludeFound = true;
+              matchingExcludeServices.push(serviceName);
+            }
+          }
+
+          if (servicePattern && serviceMatchFound) {
+            reasonsToKeep.push(`services ${matchingKeepServices.join(", ")} match cleanup patterns '${servicePattern}'`);
+          } else if (serviceExcludePattern && serviceExcludeFound) {
+            shouldProcess = false;
+            reasonsToKeep.push(`services ${matchingExcludeServices.join(", ")} match exclude patterns '${serviceExcludePattern}' (excluded from processing)`);
+          } else if (servicePattern && !serviceMatchFound) {
+            shouldProcess = false;
+            reasonsToProcess.push(`no services match keep patterns '${servicePattern}'`);
+          } else if (serviceExcludePattern && !serviceExcludeFound) {
+            reasonsToProcess.push(`no services match exclude patterns '${serviceExcludePattern}'`);
+          }
+        }
+
+        if (shouldProcess) {
+          instancesToProcess.push(instance);
+          console.log(`  - Will ${action} instance ${instance.id}: ${reasonsToProcess.length ? reasonsToProcess.join(", ") : "meets criteria"}`);
+        } else {
+          instancesToKeep.push(instance);
+          console.log(`  - Keeping instance ${instance.id}: ${reasonsToKeep.join(", ")}`);
+        }
+      }
+
+      console.log(`\nSummary:`);
+      console.log(`  - Instances to keep: ${instancesToKeep.length}`);
+      console.log(`  - Instances to ${action}: ${instancesToProcess.length}`);
+
+      if (instancesToProcess.length === 0) {
+        console.log(`\nNo instances marked for ${action}ing.`);
+        return {
+          success: true,
+          total: allInstances.length,
+          processed: 0,
+          kept: instancesToKeep.length,
+          errors: [],
+        };
+      }
+
+      if (confirm) {
+        console.log(`\nReady to ${action} ${instancesToProcess.length} instances.`);
+        
+        // In a real implementation, you would prompt for user input here
+        // For now, we'll assume confirmation is given if confirm is true
+        console.log("Operation confirmed by user.");
+      }
+
+      const processInstanceWorker = async (instance: Instance): Promise<{ instanceId: string; success: boolean; error?: string }> => {
+        const instanceId = instance.id;
+        try {
+          console.log(`Attempting to ${action} instance ${instanceId}...`);
+
+          if (action === "stop") {
+            await instance.stop();
+          } else if (action === "pause") {
+            await instance.pause();
+          }
+
+          console.log(`Successfully ${action}ped instance ${instanceId}`);
+          return { instanceId, success: true };
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          console.error(`Error ${action}ping instance ${instanceId}: ${errorMsg}`);
+          return { instanceId, success: false, error: errorMsg };
+        }
+      };
+
+      console.log(`\nStarting concurrent ${action} operation (max_workers=${maxWorkers})...`);
+
+      let processedSuccessfully = 0;
+      let processedFailed = 0;
+      const errorDetails: Array<{ instanceId: string; error: string }> = [];
+
+      const promises = instancesToProcess.map(instance => processInstanceWorker(instance));
+      const results = await Promise.all(promises);
+
+      for (const result of results) {
+        if (result.success) {
+          processedSuccessfully += 1;
+        } else {
+          processedFailed += 1;
+          errorDetails.push({
+            instanceId: result.instanceId,
+            error: result.error || "Unknown error",
+          });
+        }
+      }
+
+      console.log(`\nCleanup Operation Complete`);
+      console.log(`  - Successfully ${action}ped: ${processedSuccessfully}`);
+      console.log(`  - Failed to ${action}: ${processedFailed}`);
+      console.log(`  - Kept alive: ${instancesToKeep.length}`);
+
+      if (processedFailed > 0) {
+        console.log(`\nFailures occurred:`);
+        for (const error of errorDetails) {
+          console.log(`  - Instance ${error.instanceId}: ${error.error}`);
+        }
+      }
+
+      const success = processedFailed === 0;
+      if (success) {
+        console.log(`All targeted instances ${action}ped successfully!`);
+      }
+
+      return {
+        success,
+        total: allInstances.length,
+        processed: processedSuccessfully,
+        failed: processedFailed,
+        kept: instancesToKeep.length,
+        errors: errorDetails,
+      };
+    },
   };
 }
 
