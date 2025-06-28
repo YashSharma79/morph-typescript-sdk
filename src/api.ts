@@ -72,6 +72,13 @@ interface InstanceExecResponse {
   stderr: string;
 }
 
+interface InstanceSshKey {
+  object: "instance_ssh_key";
+  private_key: string;
+  public_key: string;
+  password: string;
+}
+
 interface MorphCloudClientOptions {
   apiKey?: string;
   baseUrl?: string;
@@ -491,6 +498,40 @@ class Instance {
       username: `${this.id}:${this.client.apiKey}`,
       privateKey: SSH_TEMP_KEYPAIR.privateKey,
     });
+  }
+
+  /**
+   * Rotate the SSH key for this instance.
+   *
+   * This generates a new ephemeral SSH key for establishing connections.
+   *
+   * @returns InstanceSshKey: The new SSH key details including private key, public key, and password.
+   * @throws Error: If the instance object is not associated with an API client or other API errors occur.
+   */
+  async sshKeyRotate(): Promise<InstanceSshKey> {
+    if (!this.client) {
+      throw new Error("Instance object is not associated with an API client");
+    }
+
+    const response = await this.client.POST(`/instance/${this.id}/ssh/key`);
+    return response as InstanceSshKey;
+  }
+
+  /**
+   * Asynchronously rotate the SSH key for this instance.
+   *
+   * This generates a new ephemeral SSH key for establishing connections.
+   *
+   * @returns InstanceSshKey: The new SSH key details including private key, public key, and password.
+   * @throws Error: If the instance object is not associated with an API client or other API errors occur.
+   */
+  async sshKeyRotateAsync(): Promise<InstanceSshKey> {
+    if (!this.client) {
+      throw new Error("Instance object is not associated with an API client");
+    }
+
+    const response = await this.client.POST(`/instance/${this.id}/ssh/key`);
+    return response as InstanceSshKey;
   }
 
   async sync(
@@ -1194,7 +1235,7 @@ class MorphCloudClient {
   };
 }
 
-export { MorphCloudClient };
+export { MorphCloudClient, Instance };
 export { InstanceStatus, SnapshotStatus };
 export type {
   MorphCloudClientOptions,
@@ -1217,4 +1258,5 @@ export type {
   InstanceSnapshotOptions,
   InstanceGetOptions,
   InstanceStopOptions,
+  InstanceSshKey,
 };
